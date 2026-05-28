@@ -567,7 +567,7 @@ class AIAgentUI(QWidget):
                 system_prompt=self.system_prompt,
                 router=self.router
             )
-            self.current_worker.tool_call_detected.connect(self.on_tool_call_detected)
+            self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
             self.current_worker.status_changed.connect(self.update_status)
             self.current_worker.thinking_part.connect(self.on_thinking_part)
             self.current_worker.response_part.connect(self.on_response_part)
@@ -586,13 +586,47 @@ class AIAgentUI(QWidget):
             conv.add_message(Message(Role.ASSISTANT, f"❌ **Ошибка:** {error_msg}"))
             self.refresh_chat_display()
 
-    def on_tool_call_detected(self, tool_name, args, text_before):
-        if self.current_worker:
-            self.current_worker.pending_tool_call = (tool_name, args)
-        self.update_status(f"Обнаружен вызов инструмента: {tool_name}")
-        if self.debug_mode:
-            print(f"[DEBUG] tool_call_detected: {tool_name}, args={args}, text_before={text_before[:50]}...")
+    # Переподключаем новый сигнал:
+    # worker.tool_calls_detected.connect(self.on_tool_calls_detected)
 
+    def on_tool_calls_detected(self, tool_calls, text_before):
+        """
+        Слот для обработки пачки вызовов инструментов, 
+        когда модель полностью завершила генерацию.
+        """
+        # 1. Сохраняем ПОЛНЫЙ ответ модели (вместе со всеми [TOOL_CALL]...) в историю
+        if self.conv_manager.current_conversation:
+            last_msg = self.conv_manager.current_conversation.messages[-1]
+            if last_msg.role == Role.ASSISTANT:
+                last_msg.content = self.current_worker._full_response
+
+        # 2. Обновляем визуальное отображение (если у тебя для этого используется refresh_chat_display)
+        self.refresh_chat_display()
+
+        # 3. Фигачим по всему списку вызванных инструментов
+        for name, args, raw_chunk, error_msg in tool_calls:
+            if error_msg:
+                # Если парсер споткнулся на конкретном туле
+                self.conv_manager.add_message_to_current(
+                    Message(role=Role.TOOL, content=json.dumps({"error": error_msg}))
+                )
+                continue
+                
+            print(f"Выполняю инструмент: {name} с аргументами {args}")
+            
+            # Выполняем инструмент через роутер
+            result = self.router.execute(name, args)
+            
+            # Кладём результат выполнения в историю сообщений
+            self.conv_manager.add_message_to_current(
+                Message(role=Role.TOOL, content=json.dumps(result, ensure_ascii=False))
+            )
+            
+        # 4. Перерисовываем интерфейс с новыми системными плашками результатов тулов
+        self.refresh_chat_display()
+        
+        self.start_agent_generation()
+    
     def cleanup_worker(self):
         if self.current_worker is not None:
             self.current_worker.stop()
@@ -666,6 +700,33 @@ class AIAgentUI(QWidget):
             self.load_conversations()
             if self.dialog_list.count() == 0:
                 self.new_conversation()
+                
+    def start_agent_generation(self):
+        """
+        Инициализирует и запускает поток воркера для текущего состояния диалога.
+        """
+        if not self.conv_manager.current_conversation:
+            return
+
+        # Создаем свежий воркер со свежим контекстом
+        self.current_worker = LMStudioStreamWorker(
+            conversation=self.conv_manager.current_conversation,
+            config_manager=self.config,  # <-- БЫЛО self.config_manager, СТАЛО self.config
+            system_prompt=self.system_prompt,
+            router=self.router
+        )
+        
+        # Коннектим стандартные сигналы вывода текста
+        if hasattr(self, 'on_response_part'):
+            self.current_worker.response_part.connect(self.on_response_part)
+        if hasattr(self, 'on_thinking_part'):
+            self.current_worker.thinking_part.connect(self.on_thinking_part)
+            
+        # Замыкаем рекурсию вызова тулов на наш слот
+        self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
+        
+        # Поехали
+        self.current_worker.start()
 
     def send_message(self):
         text = self.input_field.text().strip()
@@ -682,7 +743,7 @@ class AIAgentUI(QWidget):
             system_prompt=self.system_prompt,
             router=self.router
         )
-        self.current_worker.tool_call_detected.connect(self.on_tool_call_detected)
+        self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
         self.current_worker.status_changed.connect(self.update_status)
         self.current_worker.thinking_part.connect(self.on_thinking_part)
         self.current_worker.response_part.connect(self.on_response_part)

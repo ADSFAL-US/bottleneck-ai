@@ -1,7 +1,6 @@
 import os
 import importlib.util
 import json
-import re
 
 class BaseTool:
     def get_manifest(self):
@@ -31,83 +30,77 @@ class ToolRouter:
         specs = {name: tool.get_manifest() for name, tool in self.tools.items()}
         return (
             f"\nДОСТУПНЫЕ ИНСТРУМЕНТЫ: {json.dumps(specs, ensure_ascii=False)}.\n"
-            "Чтобы вызвать инструмент, используй формат:\n"
-            "[TOOL_CALL]{\"name\": \"имя_инструмента\", \"args\": {\"параметр\": \"значение\"}}\n"
-            "ВАЖНО: Весь вызов должен быть в одной строке. JSON должен быть валидным и завершённым.\n"
-            "После закрывающей скобки } ничего не добавляй. Не используй закрывающий тег [/TOOL_CALL].\n"
-            "Пример правильного вызова:\n"
-            "[TOOL_CALL]{\"name\": \"text-editing\", \"args\": {\"action\": \"read\", \"file_path\": \"C:\\\\test.txt\"}}\n"
+            "Чтобы вызвать инструмент, используй НАТИВНЫЙ формат строго в самом конце своего ответа:\n"
+            "<tool_calls>\n"
+            "<name>имя_инструмента</name>\n"
+            "<args>{\"параметр\": \"значение\"}</args>\n"
+            "</tool_calls>\n"
+            "ВАЖНО:\n"
+            "1. Если у инструмента нет параметров, внутри тега <args> должен быть пустой JSON-объект: <args>{}</args>.\n"
+            "2. Вызов инструмента должен быть самым финальным действием. Никакого текста после закрывающего тега </tool_calls> быть не должно."
         )
-        
 
-    def parse_tool_call(self, text: str):
+    def parse_all_tool_calls(self, text: str):
         """
-        Ищет вызов инструмента в тексте.
-        Поддерживает форматы:
-        - [TOOL_CALL]{"name": "...", "args": {...}}
-        - [TOOL_CALL]{"name": "...", "args": {...}}[/TOOL_CALL]
-        - [TOOL_CALL]{"name": "...", "args": {...}} (с возможным обрывом)
-        Возвращает (name, args, text_before_call, full_match_or_error)
+        Ищет все вызовы инструментов в нативном XML-формате модели.
+        Устойчив к отсутствию закрывающих тегов при обрыве генерации.
         """
-        # Ищем начало тега
-        start_tag = "[TOOL_CALL]"
-        start_pos = text.find(start_tag)
-        if start_pos == -1:
-            return None, None, text, None
-
-        # Текст до вызова
-        text_before = text[:start_pos]
-        # Ищем конец JSON (сбалансированные фигурные скобки)
-        json_start = start_pos + len(start_tag)
-        brace_count = 0
-        end_pos = -1
-        in_string = False
-        escape = False
-
-        for i, ch in enumerate(text[json_start:], start=json_start):
-            if escape:
-                escape = False
-                continue
-            if ch == '\\':
-                escape = True
-                continue
-            if ch == '"' and not escape:
-                in_string = not in_string
-                continue
-            if not in_string:
-                if ch == '{':
-                    brace_count += 1
-                elif ch == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_pos = i + 1  # позиция после закрывающей скобки
-                        break
-
-        if end_pos == -1:
-            # JSON не завершён – обрыв
-            return None, None, text, "Ошибка: вызов инструмента незавершён (нет закрывающей скобки). Повтори вызов полностью."
+        import re
+        tool_calls = []
+        tag = "<tool_calls>"
         
-        json_str = text[json_start:end_pos].strip()
-        # Пропускаем возможный закрывающий тег после JSON
-        remaining = text[end_pos:].lstrip()
-        if remaining.startswith("[/TOOL_CALL]"):
-            end_pos += len("[/TOOL_CALL]")  # съедаем закрывающий тег, но нам не важно
-
-        try:
-            call = json.loads(json_str)
-            name = call.get("name")
-            args = call.get("args", {})
-            if not name:
-                raise ValueError("Missing 'name' field")
-        except (json.JSONDecodeError, ValueError) as e:
-            return None, None, text, f"Ошибка парсинга JSON: {e}\nСырая строка: {json_str[:200]}"
-
-        return name, args, text_before, json_str  # возвращаем успешный парсинг
+        # Отрезаем чистый текст до первого вызова инструмента для вывода в UI
+        first_tag_pos = text.find(tag)
+        text_before = text if first_tag_pos == -1 else text[:first_tag_pos]
+        
+        # Находим все блоки <tool_calls>...</tool_calls> (или до конца текста, если тег не закрыт)
+        pattern = r"<tool_calls>(.*?)(?:</tool_calls>|$)"
+        matches = re.finditer(pattern, text, re.DOTALL)
+        
+        for match in matches:
+            block_content = match.group(1).strip()
+            raw_chunk = match.group(0)
+            if not block_content:
+                continue
+                
+            # Извлекаем имя инструмента из <name>...</name>
+            name_match = re.search(r"<name>(.*?)</name>", block_content, re.DOTALL)
+            if not name_match:
+                # Фоллбэк: если генерация оборвалась прямо внутри тега name
+                name_match = re.search(r"<name>([a-zA-Z0-9_-]+)", block_content)
+                
+            if name_match:
+                name = name_match.group(1).strip()
+                args = {}
+                
+                # Извлекаем аргументы из <args>...</args>
+                args_match = re.search(r"<args>(.*?)</args>", block_content, re.DOTALL)
+                if not args_match:
+                    # Фоллбэк на случай обрыва строки на закрывающем теге args
+                    args_match = re.search(r"<args>(\{.*\}?)", block_content, re.DOTALL)
+                    
+                if args_match:
+                    args_str = args_match.group(1).strip()
+                    if args_str and args_str != "{}":
+                        try:
+                            args = json.loads(args_str)
+                        except Exception:
+                            # Если JSON побился при стриминге, отдаем как сырую строку
+                            args = {"raw_args": args_str}
+                            
+                tool_calls.append((name, args, raw_chunk, None))
+            else:
+                tool_calls.append((None, None, raw_chunk, "Ошибка: Не удалось распознать имя инструмента в <tool_calls>"))
+                
+        return tool_calls, text_before
 
     def execute(self, name, args):
         if name in self.tools:
             try:
-                result = self.tools[name].run(**args)
+                # Проверяем, что args — это словарь, иначе берем пустой dict
+                actual_args = args if isinstance(args, dict) else {}
+                # Распаковываем его прямо в именованные аргументы метода run()
+                result = self.tools[name].run(**actual_args)
                 return result
             except Exception as e:
                 return {"error": f"Ошибка при выполнении инструмента {name}: {str(e)}"}

@@ -5,8 +5,9 @@ from PyQt6.QtCore import QThread, pyqtSignal
 class LMStudioStreamWorker(QThread):
     status_changed = pyqtSignal(str)
     thinking_part = pyqtSignal(str)
-    response_part = pyqtSignal(str)          # обычный текст (для потокового вывода)
-    tool_call_detected = pyqtSignal(str, dict, str)  # (tool_name, args, text_before_call)
+    response_part = pyqtSignal(str)          # Обычный текст для UI
+    # Сигнал теперь передает: (список_тулов, чистый_текст_до_тулов)
+    tool_calls_detected = pyqtSignal(list, str)  
     finished = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
@@ -19,7 +20,8 @@ class LMStudioStreamWorker(QThread):
         self.model = config_manager.get("lm_studio.model")
         self.temperature = config_manager.get("lm_studio.temperature", 0.2)
         self._stop = False
-        self._full_response = ""   # накапливаем весь ответ модели
+        self._full_response = ""   
+        self._emitted_len = 0      # Сколько символов мы уже успешно отправили в UI
 
     def stop(self):
         self._stop = True
@@ -27,9 +29,14 @@ class LMStudioStreamWorker(QThread):
     def run(self):
         messages_history = [{"role": "system", "content": self.system_prompt}]
         for msg in self.conversation.messages:
-            # Пропускаем thinking, tool – они не нужны для API
             if msg.role.value in ("user", "assistant", "system"):
                 messages_history.append({"role": msg.role.value, "content": msg.content})
+            elif msg.role.value == "tool":
+                # ВАЖНО: Передаем результаты прошлых тулов как контекст, иначе модель их не увидит!
+                messages_history.append({
+                    "role": "user", 
+                    "content": f"[РЕЗУЛЬТАТ ВЫЗОВА ИНСТРУМЕНТА]:\n{msg.content}"
+                })
 
         payload = {
             "model": self.model,
@@ -40,7 +47,11 @@ class LMStudioStreamWorker(QThread):
 
         try:
             response = requests.post(self.api_url, json=payload, stream=True, timeout=600)
-            buffer = ""
+            self._emitted_len = 0
+            self._full_response = ""
+            
+            tag = "[TOOL_CALL]"
+
             for line in response.iter_lines():
                 if self._stop:
                     break
@@ -56,33 +67,50 @@ class LMStudioStreamWorker(QThread):
                     data = json.loads(decoded)
                     delta = data.get("choices", [{}])[0].get("delta", {})
                     content = delta.get("content", "") or delta.get("reasoning_content", "")
+                    
                     if content:
-                        buffer += content
                         self._full_response += content
-                        # Потоково отправляем текст, НО если в будущем появится [TOOL_CALL], надо прекратить отправку
-                        # Простейший способ: проверять, нет ли в накопленном буфере начала маркера
-                        if "[TOOL_CALL]" not in buffer:
-                            self.response_part.emit(content)
-                        else:
-                            # Если маркер начался, не отправляем этот кусок – он будет частью вызова
-                            pass
+                        
+                        tag = "<tool_calls>"
+                        # Проверяем, появился ли тег вызова в ответе
+                        if tag in self._full_response:
+                            tag_pos = self._full_response.find(tag)
+                            json_start = self._full_response.find("{", tag_pos + len(tag))
+                            
+                            if json_start != -1:
+                                # Проверяем, реальный ли это вызов (между тегом и { нет текста)
+                                between = self._full_response[tag_pos + len(tag):json_start].strip()
+                                if between == "":
+                                    # Это реальный вызов инструмента — скрываем его из UI
+                                    if tag_pos > self._emitted_len:
+                                        self.response_part.emit(self._full_response[self._emitted_len:tag_pos])
+                                        self._emitted_len = tag_pos
+                                    continue
+                        
+                        # Защита от разрезания тега <tool_calls> на границе чанков
+                        is_partial = False
+                        for i in range(len(tag) - 1, 0, -1):
+                            if self._full_response.endswith(tag[:i]):
+                                is_partial = True
+                                break
+                        
+                        # Если тег сейчас не режется пополам, отправляем накопленный текст в UI
+                        if not is_partial:
+                            text_to_send = self._full_response[self._emitted_len:]
+                            if text_to_send:
+                                self.response_part.emit(text_to_send)
+                                self._emitted_len = len(self._full_response)
+                                
                 except Exception:
                     continue
 
-            # Стрим закончился – проверяем, есть ли вызов инструмента
-            # Стрим закончился – проверяем наличие вызова
+            # Стрим ПОЛНОСТЬЮ завершился. Начинаем разбор полетов.
             if self.router and self._full_response:
-                name, args, text_before, result = self.router.parse_tool_call(self._full_response)
-                if isinstance(result, str) and "Ошибка" in result:
-                    # Ошибка парсинга или обрыв
-                    self.response_part.emit(result)
-                elif name is not None:
-                    # Валидный вызов
-                    self.tool_call_detected.emit(name, args, text_before)
-                else:
-                    # Нет вызова – просто выводим весь ответ, если ещё не вывели
-                    # (но мы уже выводили частями, возможно, что-то осталось после маркера? Нет, т.к. маркера нет)
-                    pass
+                tool_calls, text_before = self.router.parse_all_tool_calls(self._full_response)
+                
+                if tool_calls:
+                    # Модель вызвала один или несколько инструментов
+                    self.tool_calls_detected.emit(tool_calls, text_before)
 
             self.finished.emit()
 
