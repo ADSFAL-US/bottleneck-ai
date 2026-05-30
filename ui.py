@@ -125,6 +125,8 @@ class AIAgentUI(QWidget):
         self.debug_mode = True
         self.current_conversation_id = None
         self.chat_loaded = True  # textbrowser не требует асинхронной загрузки
+        self.pending_tool_processing = False
+        self.pending_tool_call = None
 
         self.code_blocks = {}       # id -> (language, code)
         self.thought_states = {}    # id -> expanded (True/False)
@@ -510,12 +512,15 @@ class AIAgentUI(QWidget):
         self.refresh_chat_display()
 
     def on_stream_finished(self):
-        pending_tool_call = None
+        if self.pending_tool_processing:
+            self.pending_tool_processing = False
+            return
         if self.current_worker and hasattr(self.current_worker, 'pending_tool_call'):
             pending_tool_call = self.current_worker.pending_tool_call
         self.cleanup_worker()
         self.input_field.setEnabled(True)
         self.input_field.setFocus()
+        self.current_worker = None
         self.update_status("Готов к работе")
 
         conv = self.conv_manager.current_conversation
@@ -536,8 +541,8 @@ class AIAgentUI(QWidget):
 
         self.conv_manager.save_conversation(conv)
 
-        if pending_tool_call:
-            tool_name, tool_args = pending_tool_call
+        if self.pending_tool_call:
+            tool_name, tool_args = self.pending_tool_call
             if self.debug_mode:
                 print(f"[DEBUG] Вызов инструмента: {tool_name} с аргументами {tool_args}")
             try:
@@ -591,41 +596,99 @@ class AIAgentUI(QWidget):
 
     def on_tool_calls_detected(self, tool_calls, text_before):
         """
-        Слот для обработки пачки вызовов инструментов, 
-        когда модель полностью завершила генерацию.
+        Слот-контроллер: обрабатывает вызовы инструментов, выполняет их,
+        записывает результаты в историю диалога и пинает модель на финальный ответ.
         """
-        # 1. Сохраняем ПОЛНЫЙ ответ модели (вместе со всеми [TOOL_CALL]...) в историю
-        if self.conv_manager.current_conversation:
-            last_msg = self.conv_manager.current_conversation.messages[-1]
-            if last_msg.role == Role.ASSISTANT:
-                last_msg.content = self.current_worker._full_response
+        self.pending_tool_processing = True
 
-        # 2. Обновляем визуальное отображение (если у тебя для этого используется refresh_chat_display)
-        self.refresh_chat_display()
+        # --- ИСПРАВЛЕНИЕ ДВОЙНОГО ОТВЕТА ---
+        # Стример во время работы уже добавлял чанки в последнее сообщение диалога.
+        # Вместо создания НОВОГО сообщения, мы просто берем последнее сообщение ассистента 
+        # и гарантируем, что его контент равен полному тексту из воркера.
+        conv = self.conv_manager.current_conversation
+        if not conv:
+            return
 
-        # 3. Фигачим по всему списку вызванных инструментов
-        for name, args, raw_chunk, error_msg in tool_calls:
-            if error_msg:
-                # Если парсер споткнулся на конкретном туле
-                self.conv_manager.add_message_to_current(
-                    Message(role=Role.TOOL, content=json.dumps({"error": error_msg}))
-                )
-                continue
-                
-            print(f"Выполняю инструмент: {name} с аргументами {args}")
-            
-            # Выполняем инструмент через роутер
-            result = self.router.execute(name, args)
-            
-            # Кладём результат выполнения в историю сообщений
-            self.conv_manager.add_message_to_current(
-                Message(role=Role.TOOL, content=json.dumps(result, ensure_ascii=False))
-            )
-            
-        # 4. Перерисовываем интерфейс с новыми системными плашками результатов тулов
+        worker = self.sender()
+        full_assistant_text = worker._full_response if worker else text_before
+
+        if conv.messages and conv.messages[-1].role == Role.ASSISTANT:
+            # Обновляем существующее сообщение, а не плодим дубликаты
+            conv.messages[-1].content = full_assistant_text
+        else:
+            # На случай, если почему-то сообщения не было (крайне маловероятно)
+            assistant_msg = Message(role=Role.ASSISTANT, content=full_assistant_text)
+            self.conv_manager.add_message_to_current(assistant_msg)
+
+        # Перед тем как запускать новый цикл генерации, принудительно гасим текущий воркер,
+        # чтобы очистить поток и не ловить блокировки `if self.current_worker`
+        self.cleanup_worker()
+
+        # --- ВЫПОЛНЕНИЕ ТУЛОВ ---
+        response_blocks = []
+        for name, args, raw_chunk, error in tool_calls:
+            if error:
+                result_str = f"{{\n  \"error\": \"{error}\"\n}}"
+            elif not name:
+                result_str = "{\n  \"error\": \"Не удалось распознать имя инструмента\"\n}"
+            else:
+                try:
+                    # Выполняем логику инструмента через роутер
+                    result = self.router.execute(name, args)
+                    result_str = json.dumps(result, ensure_ascii=False, indent=2)
+                except Exception as e:
+                    result_str = f"{{\n  \"error\": \"Исключение при выполнении: {str(e)}\"\n}}"
+
+            # Нативный формат ответа среды для модели (XML)
+            block = f"<tool_responses>\n<name>{name}</name>\n<content>{result_str}</content>\n</tool_responses>"
+            response_blocks.append(block)
+
+        tool_content = "\n".join(response_blocks)
+
+        # Сохраняем результаты выполнения тулов в историю переписки
+        tool_msg = Message(role=Role.TOOL, content=tool_content)
+        self.conv_manager.add_message_to_current(tool_msg)
+
+        # Обновляем интерфейс, чтобы пользователь сразу увидел красивую плашку вызова тула
         self.refresh_chat_display()
-        
+        self.update_status("⚙️ Инструменты выполнены. Запуск финального ответа...")
+
+        # --- ИСПРАВЛЕНИЕ ПОВТОРНОГО ПИНКА ---
+        # Запускаем повторную генерацию (модель увидит историю со своим вызовом и ответом тула)
         self.start_agent_generation()
+
+    def start_agent_generation(self):
+        """
+        Внутренний метод для запуска генерации на основе текущего состояния истории.
+        Используется как при отправке нового сообщения пользователем, так и при пинке после тулов.
+        """
+        conv = self.conv_manager.current_conversation
+        if not conv:
+            return
+        if self.current_worker and self.current_worker.isRunning():
+            return
+
+        # Блокируем ввод на время генерации
+        self.input_field.setEnabled(False)
+        
+        # Создаем новый поток воркера
+        self.current_worker = LMStudioStreamWorker(
+            conversation=conv,
+            config_manager=self.config,
+            system_prompt=self.system_prompt,
+            router=self.router
+        )
+        
+        # Переподключаем все сигналы
+        self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
+        self.current_worker.status_changed.connect(self.update_status)
+        self.current_worker.thinking_part.connect(self.on_thinking_part)
+        self.current_worker.response_part.connect(self.on_response_part)
+        self.current_worker.finished.connect(self.on_stream_finished)
+        self.current_worker.error_occurred.connect(self.on_stream_error)
+        
+        # Поехали!
+        self.current_worker.start()
     
     def cleanup_worker(self):
         if self.current_worker is not None:
@@ -700,56 +763,19 @@ class AIAgentUI(QWidget):
             self.load_conversations()
             if self.dialog_list.count() == 0:
                 self.new_conversation()
-                
-    def start_agent_generation(self):
-        """
-        Инициализирует и запускает поток воркера для текущего состояния диалога.
-        """
-        if not self.conv_manager.current_conversation:
-            return
-
-        # Создаем свежий воркер со свежим контекстом
-        self.current_worker = LMStudioStreamWorker(
-            conversation=self.conv_manager.current_conversation,
-            config_manager=self.config,  # <-- БЫЛО self.config_manager, СТАЛО self.config
-            system_prompt=self.system_prompt,
-            router=self.router
-        )
-        
-        # Коннектим стандартные сигналы вывода текста
-        if hasattr(self, 'on_response_part'):
-            self.current_worker.response_part.connect(self.on_response_part)
-        if hasattr(self, 'on_thinking_part'):
-            self.current_worker.thinking_part.connect(self.on_thinking_part)
-            
-        # Замыкаем рекурсию вызова тулов на наш слот
-        self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
-        
-        # Поехали
-        self.current_worker.start()
 
     def send_message(self):
         text = self.input_field.text().strip()
         if not text or self.current_worker:
             return
+            
         user_msg = Message(Role.USER, text)
         self.conv_manager.add_message_to_current(user_msg)
         self.refresh_chat_display()
         self.input_field.clear()
-        self.input_field.setEnabled(False)
-        self.current_worker = LMStudioStreamWorker(
-            conversation=self.conv_manager.current_conversation,
-            config_manager=self.config,
-            system_prompt=self.system_prompt,
-            router=self.router
-        )
-        self.current_worker.tool_calls_detected.connect(self.on_tool_calls_detected)
-        self.current_worker.status_changed.connect(self.update_status)
-        self.current_worker.thinking_part.connect(self.on_thinking_part)
-        self.current_worker.response_part.connect(self.on_response_part)
-        self.current_worker.finished.connect(self.on_stream_finished)
-        self.current_worker.error_occurred.connect(self.on_stream_error)
-        self.current_worker.start()
+        
+        # Просто вызываем централизованный запуск генерации
+        self.start_agent_generation()
 
     def update_conversation_list_title(self, conv_id, new_title):
         for i in range(self.dialog_list.count()):

@@ -28,15 +28,20 @@ class LMStudioStreamWorker(QThread):
 
     def run(self):
         messages_history = [{"role": "system", "content": self.system_prompt}]
+        
         for msg in self.conversation.messages:
-            if msg.role.value in ("user", "assistant", "system"):
-                messages_history.append({"role": msg.role.value, "content": msg.content})
-            elif msg.role.value == "tool":
-                # ВАЖНО: Передаем результаты прошлых тулов как контекст, иначе модель их не увидит!
-                messages_history.append({
-                    "role": "user", 
-                    "content": f"[РЕЗУЛЬТАТ ВЫЗОВА ИНСТРУМЕНТА]:\n{msg.content}"
-                })
+            # Приводим роль к строке, даже если это Enum из models.py
+            role_str = msg.role.value if hasattr(msg.role, 'value') else str(msg.role)
+            role_str = role_str.lower()
+            
+            if "user" in role_str:
+                messages_history.append({"role": "user", "content": msg.content})
+            elif "assistant" in role_str:
+                messages_history.append({"role": "assistant", "content": msg.content})
+            elif "tool" in role_str:
+                # Маскируем под user, чтобы LM Studio не ругался, 
+                # модель увидит XML-структуру и поймет, что это ответ среды
+                messages_history.append({"role": "user", "content": msg.content})
 
         payload = {
             "model": self.model,
