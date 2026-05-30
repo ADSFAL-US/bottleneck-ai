@@ -3,11 +3,18 @@
 from tool_router import BaseTool
 import subprocess
 import shlex
+from pathlib import Path
 
 class Tool(BaseTool):
     def get_manifest(self):
         return {
-            "description": "Выполняет консольную команду и возвращает результат её работы.",
+            "description": (
+                "Выполняет консольную команду и возвращает результат её работы.\n"
+                "ВАЖНО: Каждое использование этого инструмента — это отдельная сессия консоли. "
+                "Состояние (переменные окружения, текущая директория, запущенные процессы) "
+                "НЕ сохраняется между вызовами.\n"
+                "Рабочая директория по умолчанию — рабочий стол пользователя (Desktop)."
+            ),
             "parameters": {
                 "command": {
                     "type": "string",
@@ -19,7 +26,10 @@ class Tool(BaseTool):
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Рабочая директория для выполнения команды (опционально)"
+                    "description": (
+                        "Рабочая директория для выполнения команды (опционально). "
+                        "Если не указана, используется рабочий стол пользователя."
+                    )
                 },
                 "shell": {
                     "type": "boolean",
@@ -36,6 +46,10 @@ class Tool(BaseTool):
         timeout = kwargs.get("timeout")
         working_dir = kwargs.get("working_dir")
         shell = kwargs.get("shell", False)
+
+        # Если рабочая директория не задана явно — используем рабочий стол
+        if working_dir is None:
+            working_dir = str(Path.home() / "Desktop")
 
         try:
             # Запускаем команду с блокировкой потока
