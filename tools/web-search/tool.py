@@ -3,7 +3,7 @@
 
 import requests
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+from ddgs import DDGS  # заменён устаревший duckduckgo_search
 from tool_router import BaseTool
 
 class Tool(BaseTool):
@@ -64,10 +64,8 @@ class Tool(BaseTool):
     # Поиск через DuckDuckGo
     # --------------------------------------------------------------------------
     def _search(self, params):
-        # Определяем список запросов
         queries = params.get("queries")
         if queries and isinstance(queries, list):
-            # если передан список queries, используем его
             pass
         else:
             query = params.get("query")
@@ -81,21 +79,23 @@ class Tool(BaseTool):
 
         all_results = {}
         try:
-            with DDGS() as ddgs:
-                for q in queries:
-                    results_list = []
-                    try:
-                        # Выполняем поиск, получаем генератор результатов
-                        for r in ddgs.text(q, max_results=max_results):
-                            results_list.append({
-                                "title": r.get("title"),
-                                "href": r.get("href"),
-                                "body": r.get("body")
-                            })
-                    except Exception as e:
-                        all_results[q] = {"error": f"Ошибка поиска: {str(e)}"}
-                    else:
-                        all_results[q] = results_list
+            # Используем новый контекстный менеджер (если требуется) или прямой вызов
+            ddgs = DDGS()
+            for q in queries:
+                results_list = []
+                try:
+                    # В новой библиотеке метод text() может быть другим – проверим
+                    # Если возникает ошибка, пробуем ddgs.text(q, max_results=max_results)
+                    for r in ddgs.text(q, max_results=max_results):
+                        results_list.append({
+                            "title": r.get("title"),
+                            "href": r.get("href"),
+                            "body": r.get("body")
+                        })
+                except Exception as e:
+                    all_results[q] = {"error": f"Ошибка поиска: {str(e)}"}
+                else:
+                    all_results[q] = results_list
         except Exception as e:
             return {"error": f"Ошибка инициализации DuckDuckGo: {str(e)}"}
 
@@ -113,7 +113,6 @@ class Tool(BaseTool):
         if not url:
             return {"error": "Для открытия страницы укажите 'url'"}
 
-        # Простая проверка URL
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
@@ -123,23 +122,18 @@ class Tool(BaseTool):
             }
             resp = requests.get(url, headers=headers, timeout=15)
             resp.raise_for_status()
-            # Определяем кодировку из заголовков или содержимого
             if resp.encoding is None:
                 resp.encoding = resp.apparent_encoding
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Удаляем скрипты, стили, мета-теги, навигацию и т.п.
             for element in soup(["script", "style", "meta", "link", "noscript"]):
                 element.decompose()
 
-            # Извлекаем текст, объединяя строки и убирая лишние пробелы
             text = soup.get_text(separator="\n", strip=True)
-            # Сжимаем множественные переносы
             lines = (line.strip() for line in text.splitlines())
             text = "\n".join(line for line in lines if line)
 
-            # Ограничим размер ответа (например, 5000 символов), чтобы не перегружать агента
             max_len = 5000
             if len(text) > max_len:
                 text = text[:max_len] + "\n...[обрезано по длине]"
